@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect } from "react";
 
 interface Flashcard {
   id: string;
@@ -34,46 +34,95 @@ export default function Home() {
   const [newAnswer, setNewAnswer] = useState("");
   const [showAddForm, setShowAddForm] = useState(false);
 
-  // Load initial state
+  // Authentication State
+  const [token, setToken] = useState<string | null>(null);
+  const [username, setUsername] = useState<string | null>(null);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authType, setAuthType] = useState<"login" | "register">("login");
+  const [authUsername, setAuthUsername] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
+
+  // Deck History State
+  const [showHistory, setShowHistory] = useState(false);
+  const [decks, setDecks] = useState<any[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [activeDeckId, setActiveDeckId] = useState<number | null>(null);
+  const [activeDeckTitle, setActiveDeckTitle] = useState("");
+
+  // Load initial state (Theme, Cards, Auth)
   useEffect(() => {
-    // Sync dark mode class
     if (typeof window !== "undefined") {
       const savedTheme = localStorage.getItem("flashbrain-theme");
       const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
       const dark = savedTheme ? savedTheme === "dark" : systemDark;
       setIsDarkMode(dark);
-      if (dark) {
-        document.documentElement.classList.add("dark");
-        document.documentElement.classList.remove("light");
-      } else {
-        document.documentElement.classList.add("light");
-        document.documentElement.classList.remove("dark");
+      syncTheme(dark);
+
+      // Load Auth Session
+      const savedToken = localStorage.getItem("flashbrain-token");
+      const savedUsername = localStorage.getItem("flashbrain-username");
+      if (savedToken && savedUsername) {
+        setToken(savedToken);
+        setUsername(savedUsername);
       }
 
-      // Load saved flashcards
-      const savedCards = localStorage.getItem("flashbrain-cards");
-      if (savedCards) {
-        try {
-          setFlashcards(JSON.parse(savedCards));
-        } catch (e) {
-          console.error("Failed to parse saved cards", e);
+      // Load saved anonymous flashcards if not logged in
+      if (!savedToken) {
+        const savedCards = localStorage.getItem("flashbrain-cards");
+        if (savedCards) {
+          try {
+            setFlashcards(JSON.parse(savedCards));
+          } catch (e) {
+            console.error("Failed to parse saved cards", e);
+          }
         }
       }
     }
   }, []);
 
-  // Save cards to localStorage when updated
-  const saveCards = (newCards: Flashcard[]) => {
-    setFlashcards(newCards);
-    localStorage.setItem("flashbrain-cards", JSON.stringify(newCards));
+  // Fetch Deck History
+  const fetchHistory = async (authToken = token) => {
+    if (!authToken) return;
+    setHistoryLoading(true);
+    try {
+      const res = await fetch("http://localhost:5000/api/decks", {
+        headers: {
+          "Authorization": `Bearer ${authToken}`,
+        },
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDecks(data.decks);
+      }
+    } catch (err) {
+      console.error("Failed to fetch deck history", err);
+    } finally {
+      setHistoryLoading(false);
+    }
   };
 
-  // Toggle Dark Mode
-  const toggleDarkMode = () => {
-    const nextDark = !isDarkMode;
-    setIsDarkMode(nextDark);
-    localStorage.setItem("flashbrain-theme", nextDark ? "dark" : "light");
-    if (nextDark) {
+  // Sync History when Token changes
+  useEffect(() => {
+    if (token) {
+      fetchHistory(token);
+    } else {
+      setDecks([]);
+      setActiveDeckId(null);
+      setActiveDeckTitle("");
+    }
+  }, [token]);
+
+  // Save anonymous cards to localStorage when updated
+  const saveCards = (newCards: Flashcard[]) => {
+    setFlashcards(newCards);
+    if (!token) {
+      localStorage.setItem("flashbrain-cards", JSON.stringify(newCards));
+    }
+  };
+
+  const syncTheme = (dark: boolean) => {
+    if (dark) {
       document.documentElement.classList.add("dark");
       document.documentElement.classList.remove("light");
     } else {
@@ -82,12 +131,50 @@ export default function Home() {
     }
   };
 
+  // Toggle Dark Mode
+  const toggleDarkMode = () => {
+    const nextDark = !isDarkMode;
+    setIsDarkMode(nextDark);
+    localStorage.setItem("flashbrain-theme", nextDark ? "dark" : "light");
+    syncTheme(nextDark);
+  };
+
   // Toast helper
   const showToast = (message: string, type: "success" | "error" | "info" = "success") => {
     setToast({ message, type });
     setTimeout(() => {
       setToast(null);
     }, 3000);
+  };
+
+  // Load a deck from History
+  const loadDeck = async (deckId: number, title: string, deckNotes: string, authToken = token) => {
+    if (!authToken) return;
+    setLoading(true);
+    try {
+      const res = await fetch(`http://localhost:5000/api/decks/${deckId}/cards`, {
+        headers: {
+          "Authorization": `Bearer ${authToken}`
+        }
+      });
+      const data = await res.json();
+      if (data.success) {
+        setFlashcards(data.flashcards);
+        setActiveDeckId(deckId);
+        setActiveDeckTitle(title);
+        setNotes(deckNotes || data.notes || "");
+        setActiveCardIndex(0);
+        setIsFlipped(false);
+        showToast(`Loaded deck: ${title}`, "success");
+      } else {
+        showToast(data.error || "Failed to load deck", "error");
+      }
+    } catch (err) {
+      console.error(err);
+      showToast("Failed to load deck from history.", "error");
+    } finally {
+      setLoading(false);
+    }
   };
 
   // Call backend to generate flashcards
@@ -120,7 +207,41 @@ export default function Home() {
           answer: card.answer,
           mastered: false,
         }));
+
+        // If logged in, save to SQLite automatically
+        if (token) {
+          const firstLine = notes.trim().split("\n")[0];
+          const deckTitle = firstLine.substring(0, 35) + (firstLine.length > 35 ? "..." : "") || "Generated Deck";
+          try {
+            const saveRes = await fetch("http://localhost:5000/api/decks", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${token}`
+              },
+              body: JSON.stringify({
+                title: deckTitle,
+                notes: notes,
+                flashcards: formattedCards
+              })
+            });
+            const saveData = await saveRes.json();
+            if (saveData.success) {
+              await loadDeck(saveData.deckId, deckTitle, notes, token);
+              fetchHistory(token);
+              showToast(`Generated and saved deck to history!`, "success");
+              setLoading(false);
+              return;
+            }
+          } catch (saveErr) {
+            console.error("Failed to auto-save deck", saveErr);
+          }
+        }
+
+        // Anonymous/Guest Mode
         saveCards(formattedCards);
+        setActiveDeckId(null);
+        setActiveDeckTitle("");
         setActiveCardIndex(0);
         setIsFlipped(false);
         showToast(`Successfully generated ${formattedCards.length} flashcards!`, "success");
@@ -136,20 +257,44 @@ export default function Home() {
   };
 
   // Toggle Mastered state of a card
-  const toggleMastered = (id: string) => {
-    const updated = flashcards.map((card) =>
-      card.id === id ? { ...card, mastered: !card.mastered } : card
+  const toggleMastered = async (id: string) => {
+    const card = flashcards.find((c) => c.id === id);
+    if (!card) return;
+
+    const newMastered = !card.mastered;
+
+    // Update locally
+    const updated = flashcards.map((c) =>
+      c.id === id ? { ...c, mastered: newMastered } : c
     );
     saveCards(updated);
+
+    // If logged in & editing saved deck, sync to backend db
+    if (token && activeDeckId) {
+      try {
+        await fetch(`http://localhost:5000/api/cards/${id}/mastered`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify({ mastered: newMastered })
+        });
+        fetchHistory(token);
+      } catch (err) {
+        console.error("Failed to update card mastery on server", err);
+      }
+    }
+
     showToast(
-      updated.find((c) => c.id === id)?.mastered
+      newMastered
         ? "Card marked as Mastered! 🎉"
         : "Card returned to Learning stack.",
       "info"
     );
   };
 
-  // Read Aloud Text using SpeechSynthesis
+  // Read Aloud Text
   const speakText = (text: string) => {
     if (typeof window !== "undefined" && "speechSynthesis" in window) {
       window.speechSynthesis.cancel();
@@ -181,11 +326,12 @@ export default function Home() {
       answer: newAnswer,
       mastered: false,
     };
+
     saveCards([newCard, ...flashcards]);
     setNewQuestion("");
     setNewAnswer("");
     setShowAddForm(false);
-    showToast("New flashcard added successfully!", "success");
+    showToast("New flashcard added locally!", "success");
   };
 
   // Delete specific card
@@ -228,6 +374,89 @@ export default function Home() {
     showToast("Loaded sample study notes!", "info");
   };
 
+  // Delete deck from history
+  const handleDeleteDeck = async (deckId: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm("Are you sure you want to delete this deck? This cannot be undone.")) return;
+
+    try {
+      const res = await fetch(`http://localhost:5000/api/decks/${deckId}`, {
+        method: "DELETE",
+        headers: {
+          "Authorization": `Bearer ${token}`
+        }
+      });
+      const data = await res.json();
+      if (data.success) {
+        showToast("Deck deleted successfully", "info");
+        fetchHistory(token);
+        if (activeDeckId === deckId) {
+          setActiveDeckId(null);
+          setActiveDeckTitle("");
+          setFlashcards([]);
+        }
+      } else {
+        showToast(data.error || "Failed to delete deck", "error");
+      }
+    } catch (err) {
+      console.error(err);
+      showToast("Error deleting deck.", "error");
+    }
+  };
+
+  // Submit login or registration form
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!authUsername.trim() || !authPassword.trim()) {
+      showToast("Please fill in all fields", "error");
+      return;
+    }
+
+    setAuthLoading(true);
+    const endpoint = authType === "login" ? "/api/login" : "/api/register";
+    try {
+      const res = await fetch(`http://localhost:5000${endpoint}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ username: authUsername, password: authPassword }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Authentication failed.");
+      }
+
+      if (authType === "login") {
+        setToken(data.token);
+        setUsername(data.username);
+        localStorage.setItem("flashbrain-token", data.token);
+        localStorage.setItem("flashbrain-username", data.username);
+        showToast(`Welcome back, ${data.username}! 👋`, "success");
+        setShowAuthModal(false);
+        setAuthUsername("");
+        setAuthPassword("");
+      } else {
+        showToast("Registration successful! Please sign in now.", "success");
+        setAuthType("login");
+        setAuthPassword("");
+      }
+    } catch (err: any) {
+      showToast(err.message || "Authentication failed.", "error");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setToken(null);
+    setUsername(null);
+    localStorage.removeItem("flashbrain-token");
+    localStorage.removeItem("flashbrain-username");
+    showToast("Logged out successfully.", "info");
+  };
+
   // Filter & Search Logic
   const filteredCards = flashcards.filter((card) => {
     const matchesSearch =
@@ -245,12 +474,12 @@ export default function Home() {
   const learningCount = totalCount - masteredCount;
   const masteryPercentage = totalCount > 0 ? Math.round((masteredCount / totalCount) * 100) : 0;
 
-  // Key navigation for carousel mode
+  // Key navigation for carousel
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (viewMode !== "carousel" || filteredCards.length === 0) return;
       if (document.activeElement?.tagName === "TEXTAREA" || document.activeElement?.tagName === "INPUT") {
-        return; // Ignore if user is typing
+        return;
       }
 
       if (e.key === "ArrowLeft") {
@@ -310,10 +539,25 @@ export default function Home() {
 
         {/* Global Controls */}
         <div className="flex items-center gap-4">
+          
+          {/* History Toggle (only if logged in) */}
+          {token && (
+            <button
+              onClick={() => setShowHistory(!showHistory)}
+              className="px-3.5 py-2 rounded-lg glass-effect hover:bg-white/10 dark:hover:bg-white/5 transition-all text-slate-300 hover:text-white flex items-center gap-2 cursor-pointer shadow-md"
+              title="View saved decks"
+            >
+              <svg className="w-4 h-4 text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
+              </svg>
+              <span className="hidden sm:inline text-xs font-semibold">My Decks</span>
+            </button>
+          )}
+
           <button
             onClick={toggleDarkMode}
             id="theme-toggle"
-            className="p-2.5 rounded-lg glass-effect hover:bg-white/10 dark:hover:bg-white/5 transition-all text-slate-400 hover:text-white"
+            className="p-2 rounded-lg glass-effect hover:bg-white/10 dark:hover:bg-white/5 transition-all text-slate-400 hover:text-white"
             aria-label="Toggle dark mode"
           >
             {isDarkMode ? (
@@ -326,6 +570,36 @@ export default function Home() {
               </svg>
             )}
           </button>
+
+          {/* Profile / Auth Area */}
+          {token ? (
+            <div className="flex items-center gap-3">
+              <div className="hidden md:flex flex-col items-end">
+                <span className="text-xs font-bold text-slate-200">{username}</span>
+                <span className="text-[10px] text-emerald-400 font-semibold tracking-wider uppercase">Sync Active</span>
+              </div>
+              <div className="w-8 h-8 rounded-lg bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center text-xs font-bold text-indigo-300">
+                {username?.substring(0, 2).toUpperCase()}
+              </div>
+              <button
+                onClick={handleLogout}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-rose-500/20 text-rose-400 hover:bg-rose-500/10 transition-all cursor-pointer"
+              >
+                Log Out
+              </button>
+            </div>
+          ) : (
+            <button
+              onClick={() => {
+                setAuthType("login");
+                setShowAuthModal(true);
+              }}
+              className="px-4 py-2 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 text-white text-xs font-semibold rounded-xl shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/30 transition-all cursor-pointer"
+            >
+              Sign In
+            </button>
+          )}
+
         </div>
       </header>
 
@@ -434,28 +708,48 @@ export default function Home() {
           {/* Deck Options Bar */}
           <div className="flex flex-col sm:flex-row gap-4 items-center justify-between p-4 rounded-xl glass-effect shadow-md">
             
-            {/* View Mode Switches */}
-            <div className="flex items-center gap-1.5 p-1 rounded-lg bg-slate-950/50 dark:bg-slate-950/50 light:bg-slate-200 border border-white/5">
-              <button
-                onClick={() => setViewMode("carousel")}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
-                  viewMode === "carousel"
-                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
-                    : "text-slate-400 hover:text-white"
-                }`}
-              >
-                Carousel View
-              </button>
-              <button
-                onClick={() => setViewMode("grid")}
-                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
-                  viewMode === "grid"
-                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
-                    : "text-slate-400 hover:text-white"
-                }`}
-              >
-                Grid View
-              </button>
+            {/* View Mode Switches & Active Deck Badge */}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex items-center gap-1.5 p-1 rounded-lg bg-slate-950/50 dark:bg-slate-950/50 light:bg-slate-200 border border-white/5">
+                <button
+                  onClick={() => setViewMode("carousel")}
+                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                    viewMode === "carousel"
+                      ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  Carousel
+                </button>
+                <button
+                  onClick={() => setViewMode("grid")}
+                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                    viewMode === "grid"
+                      ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  Grid
+                </button>
+              </div>
+
+              {/* Active Deck Title Badge */}
+              {totalCount > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-bold text-slate-300 max-w-[150px] truncate">
+                    {activeDeckTitle || "Current Deck"}
+                  </span>
+                  {activeDeckId ? (
+                    <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[9px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                      Saved
+                    </span>
+                  ) : (
+                    <span className="bg-amber-500/10 text-amber-400 border border-amber-500/20 text-[9px] px-2 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                      Temporary Session
+                    </span>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Filter stack */}
@@ -501,7 +795,6 @@ export default function Home() {
                   : "No cards match your current search or filter criteria. Try adjusting your query."}
               </p>
               
-              {/* Actions when cards exist but match nothing, or just direct Add card */}
               <div className="flex gap-4 mt-6">
                 <button
                   onClick={() => setShowAddForm(true)}
@@ -661,7 +954,7 @@ export default function Home() {
                         setActiveCardIndex((prev) => (prev > 0 ? prev - 1 : filteredCards.length - 1));
                         setIsFlipped(false);
                       }}
-                      className="p-3 rounded-full glass-effect hover:bg-white/10 text-slate-400 hover:text-white transition-all shadow-md"
+                      className="p-3 rounded-full glass-effect hover:bg-white/10 text-slate-400 hover:text-white transition-all shadow-md cursor-pointer"
                     >
                       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M15 19l-7-7 7-7" />
@@ -689,7 +982,7 @@ export default function Home() {
                         setActiveCardIndex((prev) => (prev < filteredCards.length - 1 ? prev + 1 : 0));
                         setIsFlipped(false);
                       }}
-                      className="p-3 rounded-full glass-effect hover:bg-white/10 text-slate-400 hover:text-white transition-all shadow-md"
+                      className="p-3 rounded-full glass-effect hover:bg-white/10 text-slate-400 hover:text-white transition-all shadow-md cursor-pointer"
                     >
                       <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M9 5l7 7-7 7" />
@@ -725,7 +1018,7 @@ export default function Home() {
                 <div className="flex items-center gap-3">
                   <button
                     onClick={() => setShowAddForm(true)}
-                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl shadow-md transition-all flex items-center gap-1.5"
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl shadow-md transition-all flex items-center gap-1.5 cursor-pointer"
                   >
                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -734,7 +1027,7 @@ export default function Home() {
                   </button>
                   <button
                     onClick={handleExportJSON}
-                    className="px-4 py-2 glass-effect text-slate-300 hover:text-white hover:bg-white/5 text-xs font-semibold rounded-xl transition-all flex items-center gap-1.5"
+                    className="px-4 py-2 glass-effect text-slate-300 hover:text-white hover:bg-white/5 text-xs font-semibold rounded-xl transition-all flex items-center gap-1.5 cursor-pointer"
                   >
                     <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
@@ -744,7 +1037,7 @@ export default function Home() {
                 </div>
                 <button
                   onClick={handleClearAll}
-                  className="px-4 py-2 rounded-xl text-xs font-semibold text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 transition-all border border-rose-500/20"
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-rose-400 hover:text-rose-300 hover:bg-rose-500/10 transition-all border border-rose-500/20 cursor-pointer"
                 >
                   Clear Deck
                 </button>
@@ -758,7 +1051,6 @@ export default function Home() {
             <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
               <div className="w-full max-w-lg glass-effect rounded-2xl shadow-2xl p-6 relative border border-white/10 animate-scale-up">
                 
-                {/* Header */}
                 <div className="flex items-center justify-between border-b border-white/5 pb-4 mb-4">
                   <h3 className="text-base font-semibold text-slate-200">Create Custom Flashcard</h3>
                   <button
@@ -775,7 +1067,6 @@ export default function Home() {
                   </button>
                 </div>
 
-                {/* Form */}
                 <form onSubmit={handleAddCard} className="flex flex-col gap-4">
                   <div>
                     <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">Question (Front)</label>
@@ -824,6 +1115,205 @@ export default function Home() {
         </section>
       </main>
 
+      {/* Auth Modal Overlay */}
+      {showAuthModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-md glass-effect rounded-2xl shadow-2xl p-8 relative border border-white/10 animate-scale-up">
+            <button
+              onClick={() => {
+                setShowAuthModal(false);
+                setAuthUsername("");
+                setAuthPassword("");
+              }}
+              className="absolute top-5 right-5 p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-all"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+
+            <div className="text-center mb-6">
+              <div className="w-12 h-12 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 mx-auto mb-3">
+                <span className="text-xl font-bold text-white">FB</span>
+              </div>
+              <h3 className="text-lg font-bold text-slate-200">
+                {authType === "login" ? "Welcome to FlashBrain" : "Create Account"}
+              </h3>
+              <p className="text-xs text-slate-500 mt-1">
+                {authType === "login"
+                  ? "Sign in to save your study history and progress."
+                  : "Sign up to track and master your study decks."}
+              </p>
+            </div>
+
+            <form onSubmit={handleAuthSubmit} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">
+                  Username
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={authUsername}
+                  onChange={(e) => setAuthUsername(e.target.value)}
+                  placeholder="Enter your username"
+                  className="w-full px-4 py-2.5 text-sm rounded-xl bg-slate-950/40 border border-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-200 placeholder:text-slate-600"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">
+                  Password
+                </label>
+                <input
+                  type="password"
+                  required
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="••••••••"
+                  className="w-full px-4 py-2.5 text-sm rounded-xl bg-slate-950/40 border border-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500 text-slate-200 placeholder:text-slate-600"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={authLoading}
+                className="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:from-indigo-800 disabled:to-violet-800 text-white font-semibold text-sm py-3 rounded-xl shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer mt-2"
+              >
+                {authLoading ? (
+                  <>
+                    <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Please wait...
+                  </>
+                ) : authType === "login" ? (
+                  "Sign In"
+                ) : (
+                  "Create Account"
+                )}
+              </button>
+            </form>
+
+            <div className="mt-6 text-center border-t border-white/5 pt-4">
+              <button
+                onClick={() => {
+                  setAuthType(authType === "login" ? "register" : "login");
+                  setAuthUsername("");
+                  setAuthPassword("");
+                }}
+                className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold transition-all"
+              >
+                {authType === "login"
+                  ? "Don't have an account? Sign Up"
+                  : "Already have an account? Sign In"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Sleek Sliding History Sidebar */}
+      <div className={`fixed inset-y-0 left-0 z-40 w-80 bg-slate-950/90 border-r border-white/5 backdrop-blur-lg transform transition-transform duration-300 ease-in-out ${
+        showHistory ? "translate-x-0" : "-translate-x-full"
+      }`}>
+        <div className="flex flex-col h-full p-6">
+          <div className="flex items-center justify-between border-b border-white/5 pb-4 mb-4">
+            <h3 className="text-base font-semibold text-slate-200">Study Decks History</h3>
+            <button
+              onClick={() => setShowHistory(false)}
+              className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition-all cursor-pointer"
+            >
+              <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <div className="flex-1 overflow-y-auto space-y-4 pr-1">
+            {historyLoading ? (
+              <div className="flex justify-center items-center py-12">
+                <svg className="animate-spin h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                </svg>
+              </div>
+            ) : decks.length === 0 ? (
+              <div className="text-center py-12 text-slate-500 text-xs leading-relaxed">
+                No saved study decks yet.<br/>Decks you generate will automatically save to your history list.
+              </div>
+            ) : (
+              decks.map((deck) => {
+                const masteredCount = deck.mastered_cards || 0;
+                const totalCount = deck.total_cards || 0;
+                const percent = totalCount > 0 ? Math.round((masteredCount / totalCount) * 100) : 0;
+                
+                return (
+                  <div
+                    key={deck.id}
+                    onClick={() => {
+                      loadDeck(deck.id, deck.title, deck.notes);
+                      setShowHistory(false);
+                    }}
+                    className={`p-4 rounded-xl border transition-all cursor-pointer text-left relative group ${
+                      activeDeckId === deck.id
+                        ? "bg-indigo-600/10 border-indigo-500/50"
+                        : "bg-white/5 border-white/5 hover:bg-white/10 hover:border-white/10"
+                    }`}
+                  >
+                    <div className="flex justify-between items-start gap-2 mb-1.5">
+                      <h4 className="font-semibold text-sm text-slate-200 truncate pr-6">
+                        {deck.title}
+                      </h4>
+                      <button
+                        onClick={(e) => handleDeleteDeck(deck.id, e)}
+                        className="absolute right-3 top-3.5 p-1 rounded-md text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="Delete Deck"
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                      </button>
+                    </div>
+                    <span className="text-[10px] text-slate-500 block mb-3">
+                      {new Date(deck.created_at).toLocaleDateString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit"
+                      })}
+                    </span>
+                    
+                    {/* Progress slider inside sidebar */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-[9px] font-semibold text-slate-400">
+                        <span>{percent}% Mastered</span>
+                        <span>{masteredCount}/{totalCount} cards</span>
+                      </div>
+                      <div className="w-full h-1.5 bg-slate-900/50 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-indigo-500 to-emerald-500 transition-all duration-300"
+                          style={{ width: `${percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Sidebar Backdrop Overlay */}
+      {showHistory && (
+        <div
+          onClick={() => setShowHistory(false)}
+          className="fixed inset-0 z-30 bg-black/40 backdrop-blur-xs transition-opacity"
+        />
+      )}
+
       {/* Footer */}
       <footer className="relative z-10 w-full max-w-7xl mx-auto px-6 py-8 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 mt-12 gap-4">
         <span>&copy; {new Date().getFullYear()} FlashBrain AI. All rights reserved.</span>
@@ -836,7 +1326,7 @@ export default function Home() {
   );
 }
 
-// Separate component for grid cards to manage independent flipped state
+// Separate GridCard Component to maintain independent flip state
 interface GridCardProps {
   card: Flashcard;
   onToggleMastered: (id: string) => void;
@@ -929,7 +1419,7 @@ function GridCard({ card, onToggleMastered, onDelete, onSpeak, isSpeaking }: Gri
           </div>
 
           <div className="flex-1 flex items-center justify-center text-center py-2">
-            <p className="text-xs font-medium leading-relaxed text-slate-100 dark:text-slate-100 light:text-slate-900 line-clamp-4">
+            <p className="text-xs font-medium leading-relaxed text-slate-100 dark:text-slate-100 light:text-slate-900 line-clamp-4 font-medium">
               {card.answer}
             </p>
           </div>
