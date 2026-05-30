@@ -5,7 +5,15 @@ const { GoogleGenAI } = require('@google/genai');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('./database');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
 require('dotenv').config();
+
+// Configure Multer for PDF file uploading
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
+});
 
 const app = express();
 app.use(cors());
@@ -114,9 +122,21 @@ app.post('/api/decks', authenticateToken, async (req, res) => {
 
         // Save all associated cards
         for (const card of flashcards) {
+            const answerText = card.answer || card.correct_answer || '';
+            const distractorsText = card.distractors ? JSON.stringify(card.distractors) : null;
             await db.run(
-                'INSERT INTO flashcards (deck_id, question, answer, mastered) VALUES (?, ?, ?, ?)',
-                [deckId, card.question, card.answer, card.mastered ? 1 : 0]
+                'INSERT INTO flashcards (deck_id, question, answer, mastered, ease_factor, intervals, repetitions, next_review_at, distractors) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [
+                    deckId, 
+                    card.question, 
+                    answerText, 
+                    card.mastered ? 1 : 0,
+                    card.ease_factor !== undefined ? card.ease_factor : 2.5,
+                    card.intervals !== undefined ? card.intervals : 0,
+                    card.repetitions !== undefined ? card.repetitions : 0,
+                    card.next_review_at || null,
+                    distractorsText
+                ]
             );
         }
 
@@ -161,13 +181,19 @@ app.get('/api/decks/:id/cards', authenticateToken, async (req, res) => {
             return res.status(404).json({ error: 'Deck not found.' });
         }
 
-        const flashcards = await db.all('SELECT id, question, answer, mastered FROM flashcards WHERE deck_id = ?', [deckId]);
+        const flashcards = await db.all('SELECT id, question, answer, mastered, ease_factor, intervals, repetitions, next_review_at, distractors FROM flashcards WHERE deck_id = ?', [deckId]);
         
         const formattedCards = flashcards.map(c => ({
             id: c.id.toString(), // String IDs for frontend client state compatibility
             question: c.question,
             answer: c.answer,
-            mastered: c.mastered === 1
+            correct_answer: c.answer,
+            mastered: c.mastered === 1,
+            ease_factor: c.ease_factor !== null && c.ease_factor !== undefined ? c.ease_factor : 2.5,
+            intervals: c.intervals !== null && c.intervals !== undefined ? c.intervals : 0,
+            repetitions: c.repetitions !== null && c.repetitions !== undefined ? c.repetitions : 0,
+            next_review_at: c.next_review_at || null,
+            distractors: c.distractors ? JSON.parse(c.distractors) : []
         }));
 
         res.json({ success: true, title: deck.title, notes: deck.notes, flashcards: formattedCards });
@@ -177,30 +203,86 @@ app.get('/api/decks/:id/cards', authenticateToken, async (req, res) => {
     }
 });
 
-// Toggle / Update Card Mastery
+// Toggle / Update Card Mastery / Review
 app.put('/api/cards/:id/mastered', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const cardId = req.params.id;
-        const { mastered } = req.body;
+        const { mastered, rating } = req.body;
 
-        if (mastered === undefined) {
-            return res.status(400).json({ error: 'Mastered state is required.' });
-        }
-
-        // Verify ownership by checking the card's deck owner
-        const cardOwner = await db.get(`
-            SELECT d.user_id FROM flashcards f
+        // Fetch card details along with user ownership verification
+        const card = await db.get(`
+            SELECT f.*, d.user_id FROM flashcards f
             JOIN decks d ON f.deck_id = d.id
             WHERE f.id = ?
         `, [cardId]);
 
-        if (!cardOwner || cardOwner.user_id !== userId) {
+        if (!card) {
+            return res.status(404).json({ error: 'Card not found.' });
+        }
+
+        if (card.user_id !== userId) {
             return res.status(403).json({ error: 'Unauthorized to modify this card.' });
         }
 
-        await db.run('UPDATE flashcards SET mastered = ? WHERE id = ?', [mastered ? 1 : 0, cardId]);
-        res.json({ success: true, message: 'Card mastery updated.' });
+        if (rating !== undefined) {
+            // Spaced Repetition (SM-2) Logic
+            const q = Math.min(5, Math.max(0, parseInt(rating, 10)));
+            let ef = card.ease_factor !== null && card.ease_factor !== undefined ? card.ease_factor : 2.5;
+            let rep = card.repetitions !== null && card.repetitions !== undefined ? card.repetitions : 0;
+            let interval = card.intervals !== null && card.intervals !== undefined ? card.intervals : 0;
+
+            if (q < 3) {
+                rep = 0;
+                interval = 1;
+            } else {
+                if (rep === 0) {
+                    interval = 1;
+                } else if (rep === 1) {
+                    interval = 6;
+                } else {
+                    interval = Math.round(interval * ef);
+                }
+                rep += 1;
+            }
+
+            // Calculate new ease factor
+            ef = ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
+            if (ef < 1.3) ef = 1.3;
+
+            // Calculate next review datetime
+            const nextReviewDate = new Date();
+            nextReviewDate.setDate(nextReviewDate.getDate() + interval);
+            const next_review_at = nextReviewDate.toISOString();
+
+            // Set mastered status dynamically (rating Easy (5) or Hard (3-4) maps to mastered, Again (1) to learning)
+            const newMastered = q >= 4 ? 1 : 0;
+
+            await db.run(`
+                UPDATE flashcards 
+                SET ease_factor = ?, intervals = ?, repetitions = ?, next_review_at = ?, mastered = ?
+                WHERE id = ?
+            `, [ef, interval, rep, next_review_at, newMastered, cardId]);
+
+            return res.json({ 
+                success: true, 
+                message: 'Card reviewed successfully using SM-2 algorithm.',
+                card: {
+                    id: cardId,
+                    ease_factor: ef,
+                    intervals: interval,
+                    repetitions: rep,
+                    next_review_at,
+                    mastered: newMastered === 1
+                }
+            });
+        } else if (mastered !== undefined) {
+            // Standard Mastery Toggle
+            await db.run('UPDATE flashcards SET mastered = ? WHERE id = ?', [mastered ? 1 : 0, cardId]);
+            return res.json({ success: true, message: 'Card mastery updated.' });
+        } else {
+            return res.status(400).json({ error: 'Either mastered state or rating score is required.' });
+        }
     } catch (error) {
         console.error('Update card error:', error);
         res.status(500).json({ error: 'Failed to update card.' });
@@ -240,7 +322,7 @@ app.post('/api/generate-cards', async (req, res) => {
 
         const response = await ai.models.generateContent({
             model: 'gemini-2.5-flash',
-            contents: `You are an expert tutor. Take the following study notes and turn them into a list of 5 high-quality flashcards for active recall learning. Each card must have a specific "question" on the front and a crisp, direct "answer" on the back. Notes: ${notes}`,
+            contents: `You are an expert tutor. Take the following study notes and turn them into a list of 5 high-quality flashcards for active recall learning. Each card must have a specific "question" on the front, a crisp, direct "correct_answer" on the back, and exactly three plausible but incorrect choices ("distractors") for multiple choice testing. Notes: ${notes}`,
             config: {
                 responseMimeType: 'application/json',
                 responseSchema: {
@@ -249,22 +331,92 @@ app.post('/api/generate-cards', async (req, res) => {
                         type: 'object',
                         properties: {
                             question: { type: 'string' },
-                            answer: { type: 'string' }
+                            correct_answer: { type: 'string' },
+                            distractors: {
+                                type: 'array',
+                                items: { type: 'string' }
+                            }
                         },
-                        required: ['question', 'answer']
+                        required: ['question', 'correct_answer', 'distractors']
                     }
                 }
             }
         });
 
         const responseText = response.text;
-        const flashcards = JSON.parse(responseText);
+        const rawFlashcards = JSON.parse(responseText);
+
+        const flashcards = rawFlashcards.map(card => ({
+            question: card.question,
+            correct_answer: card.correct_answer,
+            answer: card.correct_answer, // compatibility
+            distractors: card.distractors
+        }));
 
         res.json({ success: true, flashcards });
 
     } catch (error) {
         console.error('Error generating cards:', error);
         res.status(500).json({ error: 'Failed to generate flashcards.' });
+    }
+});
+
+// POST route: Ingests PDF file, extracts text, sends to Gemini
+app.post('/api/upload-pdf', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'Please upload a PDF file!' });
+        }
+
+        // Parse text from file buffer
+        const parsedPdf = await pdfParse(req.file.buffer);
+        const extractedText = parsedPdf.text;
+
+        if (!extractedText || extractedText.trim().length === 0) {
+            return res.status(400).json({ error: 'Could not extract text content from the uploaded PDF.' });
+        }
+
+        // Limit raw text segment size to avoid exceeding prompt constraints
+        const textSegment = extractedText.substring(0, 15000);
+
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `You are an expert tutor. Take the following text segment from an uploaded document, parse the material, and extract the key concepts into a list of 5 high-quality flashcards for active recall learning. Each card must have a specific "question" on the front, a crisp, direct "correct_answer" on the back, and exactly three plausible but incorrect choices ("distractors") for multiple choice testing. Text Segment: ${textSegment}`,
+            config: {
+                responseMimeType: 'application/json',
+                responseSchema: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            question: { type: 'string' },
+                            correct_answer: { type: 'string' },
+                            distractors: {
+                                type: 'array',
+                                items: { type: 'string' }
+                            }
+                        },
+                        required: ['question', 'correct_answer', 'distractors']
+                    }
+                }
+            }
+        });
+
+        const responseText = response.text;
+        const rawFlashcards = JSON.parse(responseText);
+
+        const flashcards = rawFlashcards.map(card => ({
+            question: card.question,
+            correct_answer: card.correct_answer,
+            answer: card.correct_answer, // compatibility
+            distractors: card.distractors
+        }));
+
+        res.json({ success: true, flashcards });
+
+    } catch (error) {
+        console.error('Error processing PDF upload:', error);
+        res.status(500).json({ error: 'Failed to process PDF upload and generate flashcards.' });
     }
 });
 
