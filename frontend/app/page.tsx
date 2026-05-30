@@ -1,12 +1,18 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 
 interface Flashcard {
   id: string;
   question: string;
   answer: string;
+  correct_answer?: string; // compatibility
   mastered: boolean;
+  ease_factor?: number;
+  intervals?: number;
+  repetitions?: number;
+  next_review_at?: string | null;
+  distractors?: string[];
 }
 
 const SAMPLE_NOTES = `Types of Neurons in the Human Body:
@@ -16,6 +22,8 @@ const SAMPLE_NOTES = `Types of Neurons in the Human Body:
 
 Active Recall learning is the most effective study technique because it forces the brain to retrieve information rather than passively reviewing it. This strengthens neural connections and improves long-term retention.`;
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:5000";
+
 export default function Home() {
   const [notes, setNotes] = useState("");
   const [loading, setLoading] = useState(false);
@@ -23,6 +31,14 @@ export default function Home() {
   const [activeCardIndex, setActiveCardIndex] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
   const [viewMode, setViewMode] = useState<"carousel" | "grid">("carousel");
+  const [studyMode, setStudyMode] = useState<"flip" | "quiz">("flip");
+  const [notesType, setNotesType] = useState<"text" | "pdf">("text");
+  const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [pdfUploading, setPdfUploading] = useState(false);
+  const [pdfProgress, setPdfProgress] = useState(0);
+  const [shuffledChoices, setShuffledChoices] = useState<string[]>([]);
+  const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [filterMode, setFilterMode] = useState<"all" | "learning" | "mastered">("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [isDarkMode, setIsDarkMode] = useState(true);
@@ -49,6 +65,19 @@ export default function Home() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [activeDeckId, setActiveDeckId] = useState<number | null>(null);
   const [activeDeckTitle, setActiveDeckTitle] = useState("");
+
+  // Filter & Search Logic
+  const filteredCards = useMemo(() => {
+    return flashcards.filter((card) => {
+      const matchesSearch =
+        card.question.toLowerCase().includes(searchQuery.toLowerCase()) ||
+        card.answer.toLowerCase().includes(searchQuery.toLowerCase());
+      
+      if (filterMode === "mastered") return matchesSearch && card.mastered;
+      if (filterMode === "learning") return matchesSearch && !card.mastered;
+      return matchesSearch;
+    });
+  }, [flashcards, searchQuery, filterMode]);
 
   // Load initial state (Theme, Cards, Auth)
   useEffect(() => {
@@ -86,7 +115,7 @@ export default function Home() {
     if (!authToken) return;
     setHistoryLoading(true);
     try {
-      const res = await fetch("http://localhost:5000/api/decks", {
+      const res = await fetch(`${API_BASE}/api/decks`, {
         headers: {
           "Authorization": `Bearer ${authToken}`,
         },
@@ -112,6 +141,41 @@ export default function Home() {
       setActiveDeckTitle("");
     }
   }, [token]);
+
+  // Shuffling logic for Quiz Mode choices
+  useEffect(() => {
+    if (filteredCards.length > 0 && activeCardIndex < filteredCards.length) {
+      const card = filteredCards[activeCardIndex];
+      const correct = card.answer || card.correct_answer || "";
+      const dist = card.distractors || [];
+      
+      // Fallback distractors if empty
+      const choices = [correct, ...dist];
+      if (choices.length < 4) {
+        const fakes = ["Option A", "Option B", "Option C", "Option D"];
+        let fakeIdx = 0;
+        while (choices.length < 4 && fakeIdx < fakes.length) {
+          const fake = fakes[fakeIdx++];
+          if (!choices.includes(fake)) {
+            choices.push(fake);
+          }
+        }
+      }
+      
+      // Shuffle choices using Fisher-Yates
+      const shuffled = [...choices];
+      for (let i = shuffled.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+      }
+      
+      setShuffledChoices(shuffled);
+      setSelectedAnswer(null); // Reset choice selection on card change
+    } else {
+      setShuffledChoices([]);
+      setSelectedAnswer(null);
+    }
+  }, [activeCardIndex, filteredCards, studyMode]);
 
   // Save anonymous cards to localStorage when updated
   const saveCards = (newCards: Flashcard[]) => {
@@ -152,7 +216,7 @@ export default function Home() {
     if (!authToken) return;
     setLoading(true);
     try {
-      const res = await fetch(`http://localhost:5000/api/decks/${deckId}/cards`, {
+      const res = await fetch(`${API_BASE}/api/decks/${deckId}/cards`, {
         headers: {
           "Authorization": `Bearer ${authToken}`
         }
@@ -187,7 +251,7 @@ export default function Home() {
 
     setLoading(true);
     try {
-      const res = await fetch("http://localhost:5000/api/generate-cards", {
+      const res = await fetch(`${API_BASE}/api/generate-cards`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -204,8 +268,14 @@ export default function Home() {
         const formattedCards = data.flashcards.map((card: any) => ({
           id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
           question: card.question,
-          answer: card.answer,
+          correct_answer: card.correct_answer || card.answer,
+          answer: card.correct_answer || card.answer, // compatibility
           mastered: false,
+          ease_factor: 2.5,
+          intervals: 0,
+          repetitions: 0,
+          next_review_at: null,
+          distractors: card.distractors || []
         }));
 
         // If logged in, save to SQLite automatically
@@ -213,7 +283,7 @@ export default function Home() {
           const firstLine = notes.trim().split("\n")[0];
           const deckTitle = firstLine.substring(0, 35) + (firstLine.length > 35 ? "..." : "") || "Generated Deck";
           try {
-            const saveRes = await fetch("http://localhost:5000/api/decks", {
+            const saveRes = await fetch(`${API_BASE}/api/decks`, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -272,7 +342,7 @@ export default function Home() {
     // If logged in & editing saved deck, sync to backend db
     if (token && activeDeckId) {
       try {
-        await fetch(`http://localhost:5000/api/cards/${id}/mastered`, {
+        await fetch(`${API_BASE}/api/cards/${id}/mastered`, {
           method: "PUT",
           headers: {
             "Content-Type": "application/json",
@@ -292,6 +362,207 @@ export default function Home() {
         : "Card returned to Learning stack.",
       "info"
     );
+  };
+
+  // Spaced Repetition card scheduler rating
+  const rateCard = async (id: string, rating: number) => {
+    const card = flashcards.find((c) => c.id === id);
+    if (!card) return;
+
+    let updatedCards = [...flashcards];
+    let nextReviewDate = new Date();
+
+    if (token && activeDeckId) {
+      try {
+        const res = await fetch(`${API_BASE}/api/cards/${id}/mastered`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${token}`
+          },
+          body: JSON.stringify({ rating })
+        });
+        const data = await res.json();
+        if (data.success && data.card) {
+          updatedCards = flashcards.map(c => 
+            c.id === id ? { 
+              ...c, 
+              ease_factor: data.card.ease_factor,
+              intervals: data.card.intervals,
+              repetitions: data.card.repetitions,
+              next_review_at: data.card.next_review_at,
+              mastered: data.card.mastered
+            } : c
+          );
+          saveCards(updatedCards);
+          fetchHistory(token);
+        }
+      } catch (err) {
+        console.error("Failed to submit card rating to server", err);
+      }
+    } else {
+      // Simulate SM-2 locally for guests
+      const q = rating;
+      let ef = card.ease_factor !== undefined ? card.ease_factor : 2.5;
+      let rep = card.repetitions !== undefined ? card.repetitions : 0;
+      let interval = card.intervals !== undefined ? card.intervals : 0;
+
+      if (q < 3) {
+        rep = 0;
+        interval = 1;
+      } else {
+        if (rep === 0) {
+          interval = 1;
+        } else if (rep === 1) {
+          interval = 6;
+        } else {
+          interval = Math.round(interval * ef);
+        }
+        rep += 1;
+      }
+      ef = ef + (0.1 - (5 - q) * (0.08 + (5 - q) * 0.02));
+      if (ef < 1.3) ef = 1.3;
+
+      nextReviewDate.setDate(nextReviewDate.getDate() + interval);
+      
+      updatedCards = flashcards.map(c => 
+        c.id === id ? { 
+          ...c, 
+          ease_factor: ef,
+          intervals: interval,
+          repetitions: rep,
+          next_review_at: nextReviewDate.toISOString(),
+          mastered: q >= 4
+        } : c
+      );
+      saveCards(updatedCards);
+    }
+
+    const ratingLabels: Record<number, string> = { 1: "Again (1)", 3: "Hard (3)", 5: "Easy (5)" };
+    showToast(`Card rated: ${ratingLabels[rating] || rating}`, "info");
+
+    // Automatically advance to the next card after a small delay in carousel mode (unless in Quiz Mode)
+    setTimeout(() => {
+      if (viewMode === "carousel" && filteredCards.length > 1 && studyMode !== "quiz") {
+        setActiveCardIndex(prev => (prev < filteredCards.length - 1 ? prev + 1 : 0));
+        setIsFlipped(false);
+      }
+    }, 800);
+  };
+
+  // Option selection handler for Quiz Mode
+  const handleSelectOption = (option: string) => {
+    if (selectedAnswer !== null) return;
+    setSelectedAnswer(option);
+    
+    const correct = filteredCards[activeCardIndex].answer || filteredCards[activeCardIndex].correct_answer || "";
+    const isCorrect = option === correct;
+    
+    // Auto rate: correct = Easy (5), incorrect = Again (1)
+    rateCard(filteredCards[activeCardIndex].id, isCorrect ? 5 : 1);
+  };
+
+  // PDF Document Ingestion Pipeline
+  const handlePdfUpload = async (file: File) => {
+    if (!file) return;
+    if (file.type !== "application/pdf") {
+      showToast("Only PDF documents are supported!", "error");
+      return;
+    }
+    setLoading(true);
+    setPdfUploading(true);
+    setPdfProgress(15);
+    
+    const formData = new FormData();
+    formData.append("file", file);
+    
+    // Simulate upload/extraction progress stages
+    const interval = setInterval(() => {
+      setPdfProgress(prev => {
+        if (prev >= 90) {
+          clearInterval(interval);
+          return 90;
+        }
+        return prev + 12;
+      });
+    }, 400);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/upload-pdf`, {
+        method: "POST",
+        body: formData,
+      });
+
+      clearInterval(interval);
+      setPdfProgress(100);
+
+      if (!res.ok) {
+        throw new Error("Failed to process the PDF and extract flashcards.");
+      }
+
+      const data = await res.json();
+      if (data.success && Array.isArray(data.flashcards)) {
+        const formattedCards = data.flashcards.map((card: any) => ({
+          id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          question: card.question,
+          correct_answer: card.correct_answer,
+          answer: card.correct_answer, // compatibility
+          mastered: false,
+          ease_factor: 2.5,
+          intervals: 0,
+          repetitions: 0,
+          next_review_at: null,
+          distractors: card.distractors
+        }));
+
+        // If logged in, save deck entry to SQLite automatically
+        if (token) {
+          const deckTitle = file.name.replace(/\.[^/.]+$/, "") || "Uploaded PDF Deck";
+          try {
+            const saveRes = await fetch(`${API_BASE}/api/decks`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${token}`
+              },
+              body: JSON.stringify({
+                title: deckTitle,
+                notes: `Generated from PDF file: ${file.name}`,
+                flashcards: formattedCards
+              })
+            });
+            const saveData = await saveRes.json();
+            if (saveData.success) {
+              await loadDeck(saveData.deckId, deckTitle, `Generated from PDF file: ${file.name}`, token);
+              fetchHistory(token);
+              showToast(`PDF parsed and saved to study history!`, "success");
+              setLoading(false);
+              setPdfUploading(false);
+              return;
+            }
+          } catch (saveErr) {
+            console.error("Failed to auto-save PDF deck", saveErr);
+          }
+        }
+
+        // Guest mode fallback
+        saveCards(formattedCards);
+        setActiveDeckId(null);
+        setActiveDeckTitle("");
+        setActiveCardIndex(0);
+        setIsFlipped(false);
+        showToast(`Successfully generated ${formattedCards.length} cards from PDF!`, "success");
+      } else {
+        throw new Error(data.error || "Failed to parse flashcard list");
+      }
+    } catch (err: any) {
+      console.error(err);
+      showToast(err.message || "Failed to process PDF. Check if backend is active.", "error");
+    } finally {
+      setLoading(false);
+      setPdfUploading(false);
+      setPdfFile(null);
+    }
   };
 
   // Read Aloud Text
@@ -380,7 +651,7 @@ export default function Home() {
     if (!confirm("Are you sure you want to delete this deck? This cannot be undone.")) return;
 
     try {
-      const res = await fetch(`http://localhost:5000/api/decks/${deckId}`, {
+      const res = await fetch(`${API_BASE}/api/decks/${deckId}`, {
         method: "DELETE",
         headers: {
           "Authorization": `Bearer ${token}`
@@ -415,7 +686,7 @@ export default function Home() {
     setAuthLoading(true);
     const endpoint = authType === "login" ? "/api/login" : "/api/register";
     try {
-      const res = await fetch(`http://localhost:5000${endpoint}`, {
+      const res = await fetch(`${API_BASE}${endpoint}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -456,17 +727,6 @@ export default function Home() {
     localStorage.removeItem("flashbrain-username");
     showToast("Logged out successfully.", "info");
   };
-
-  // Filter & Search Logic
-  const filteredCards = flashcards.filter((card) => {
-    const matchesSearch =
-      card.question.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      card.answer.toLowerCase().includes(searchQuery.toLowerCase());
-    
-    if (filterMode === "mastered") return matchesSearch && card.mastered;
-    if (filterMode === "learning") return matchesSearch && !card.mastered;
-    return matchesSearch;
-  });
 
   // Calculate stats
   const totalCount = flashcards.length;
@@ -530,7 +790,7 @@ export default function Home() {
             <span className="text-xl font-bold text-white">FB</span>
           </div>
           <div>
-            <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent dark:from-white dark:to-slate-400 light:from-slate-900 light:to-slate-600">
+            <h1 className="text-xl font-bold tracking-tight bg-gradient-to-r from-slate-900 to-slate-600 bg-clip-text text-transparent dark:from-white dark:to-slate-400">
               FlashBrain
             </h1>
             <p className="text-xs text-slate-500 dark:text-slate-400">AI-Powered Active Recall</p>
@@ -610,63 +870,224 @@ export default function Home() {
         <section className="lg:col-span-4 flex flex-col gap-6">
           <div className="p-6 rounded-2xl glass-effect shadow-xl flex flex-col gap-5">
             <div>
-              <h2 className="text-lg font-semibold text-slate-200 dark:text-slate-200 light:text-slate-900">Study Notes Input</h2>
-              <p className="text-xs text-slate-500 mt-1">Paste your text, lectures, or summaries to generate card decks.</p>
+              <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-200">Study Source Ingestion</h2>
+              <p className="text-xs text-slate-500 mt-1">Paste your text summaries or upload documents to generate active recall decks.</p>
             </div>
 
-            <form onSubmit={handleGenerate} className="flex flex-col gap-4">
-              <div className="relative">
-                <textarea
-                  value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
-                  placeholder="Enter your notes here..."
-                  className="w-full h-64 px-4 py-3 text-sm rounded-xl bg-slate-950/40 dark:bg-slate-950/40 light:bg-white/80 border border-white/10 dark:border-white/10 light:border-slate-300 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/80 resize-none font-sans text-slate-300 dark:text-slate-300 light:text-slate-900 transition-all placeholder:text-slate-600 dark:placeholder:text-slate-500"
-                  maxLength={10000}
-                />
-                <span className="absolute bottom-3 right-3 text-[10px] text-slate-600">
-                  {notes.length}/10,000
-                </span>
-              </div>
+            {/* Ingestion Tabs */}
+            <div className="flex gap-1.5 p-1 rounded-xl bg-slate-950/50 border border-white/5">
+              <button
+                type="button"
+                onClick={() => setNotesType("text")}
+                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  notesType === "text"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                Text Notes
+              </button>
+              <button
+                type="button"
+                onClick={() => setNotesType("pdf")}
+                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all cursor-pointer ${
+                  notesType === "pdf"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                PDF Document
+              </button>
+            </div>
 
-              <div className="flex gap-2.5">
-                <button
-                  type="button"
-                  onClick={fillSampleNotes}
-                  className="flex-1 px-4 py-2.5 rounded-xl border border-white/10 dark:border-white/10 light:border-slate-300 text-xs font-semibold text-slate-400 hover:text-white dark:hover:text-white light:hover:text-slate-900 hover:bg-white/5 transition-all"
+            {notesType === "text" ? (
+              <form onSubmit={handleGenerate} className="flex flex-col gap-4">
+                <div className="relative">
+                  <textarea
+                    value={notes}
+                    onChange={(e) => setNotes(e.target.value)}
+                    placeholder="Enter your notes here..."
+                    className="w-full h-64 px-4 py-3 text-sm rounded-xl bg-white/80 dark:bg-slate-950/40 border border-slate-300 dark:border-white/10 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/80 resize-none font-sans text-slate-900 dark:text-slate-300 transition-all placeholder:text-slate-600 dark:placeholder:text-slate-500"
+                    maxLength={10000}
+                  />
+                  <span className="absolute bottom-3 right-3 text-[10px] text-slate-600">
+                    {notes.length}/10,000
+                  </span>
+                </div>
+
+                <div className="flex gap-2.5">
+                  <button
+                    type="button"
+                    onClick={fillSampleNotes}
+                    className="flex-1 px-4 py-2.5 rounded-xl border border-slate-300 dark:border-white/10 text-xs font-semibold text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-white/5 transition-all"
+                  >
+                    Load Sample Notes
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={loading}
+                    className="flex-1 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:from-indigo-800 disabled:to-violet-800 text-white font-semibold text-xs py-2.5 px-4 rounded-xl shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {loading ? (
+                      <>
+                        <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                        </svg>
+                        Generate Cards
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="flex flex-col gap-4">
+                <div
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDragOver(true);
+                  }}
+                  onDragLeave={() => setIsDragOver(false)}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsDragOver(false);
+                    const files = e.dataTransfer.files;
+                    if (files && files[0]) {
+                      setPdfFile(files[0]);
+                    }
+                  }}
+                  className={`w-full h-64 border-2 border-dashed rounded-xl flex flex-col items-center justify-center p-4 text-center cursor-pointer transition-all duration-300 ${
+                    isDragOver
+                      ? "border-indigo-500 bg-indigo-500/10 scale-[0.99]"
+                      : pdfFile
+                      ? "border-emerald-500/50 bg-emerald-500/5"
+                      : "border-white/10 bg-slate-950/40 hover:border-indigo-500/30"
+                  }`}
+                  onClick={() => {
+                    const input = document.createElement("input");
+                    input.type = "file";
+                    input.accept = "application/pdf";
+                    input.onchange = (e) => {
+                      const files = (e.target as HTMLInputElement).files;
+                      if (files && files[0]) {
+                        setPdfFile(files[0]);
+                      }
+                    };
+                    input.click();
+                  }}
                 >
-                  Load Sample Notes
-                </button>
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="flex-1 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:from-indigo-800 disabled:to-violet-800 text-white font-semibold text-xs py-2.5 px-4 rounded-xl shadow-lg shadow-indigo-600/20 hover:shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer"
-                >
-                  {loading ? (
-                    <>
-                      <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
-                      </svg>
-                      Generating...
-                    </>
+                  {pdfFile ? (
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="w-12 h-12 rounded-xl bg-emerald-500/15 text-emerald-400 flex items-center justify-center shadow-lg">
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                        </svg>
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-slate-200 truncate max-w-[220px]">
+                          {pdfFile.name}
+                        </p>
+                        <p className="text-[10px] text-slate-500 font-semibold uppercase mt-0.5">
+                          {(pdfFile.size / (1024 * 1024)).toFixed(2)} MB
+                        </p>
+                      </div>
+                      <span className="text-[10px] text-indigo-400 font-bold hover:underline">
+                        Click to change file
+                      </span>
+                    </div>
                   ) : (
-                    <>
-                      <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M13 10V3L4 14h7v7l9-11h-7z" />
-                      </svg>
-                      Generate Cards
-                    </>
+                    <div className="flex flex-col items-center gap-3">
+                      <div className="w-12 h-12 rounded-xl bg-white/5 text-slate-400 flex items-center justify-center">
+                        <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                      </div>
+                      <div>
+                        <p className="text-sm font-semibold text-slate-300">
+                          Drag & drop PDF here
+                        </p>
+                        <p className="text-[11px] text-slate-500 mt-1">
+                          or click to browse from files
+                        </p>
+                      </div>
+                      <span className="text-[9px] text-slate-600 bg-white/5 border border-white/5 px-2 py-0.5 rounded-md mt-2 font-medium">
+                        Max 10 MB
+                      </span>
+                    </div>
                   )}
-                </button>
+                </div>
+
+                {pdfUploading && (
+                  <div className="w-full space-y-2 animate-pulse">
+                    <div className="flex justify-between text-xs font-semibold text-slate-400">
+                      <span>Parsing Document...</span>
+                      <span>{pdfProgress}%</span>
+                    </div>
+                    <div className="w-full h-2 bg-slate-900 rounded-full overflow-hidden border border-white/5">
+                      <div
+                        className="h-full bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 transition-all duration-300 animate-pulse"
+                        style={{ width: `${pdfProgress}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex gap-2">
+                  {pdfFile && !pdfUploading && (
+                    <button
+                      type="button"
+                      onClick={() => setPdfFile(null)}
+                      className="px-4 py-2.5 rounded-xl border border-white/10 text-xs font-semibold text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 hover:border-rose-500/20 transition-all cursor-pointer"
+                    >
+                      Remove
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (pdfFile) {
+                        handlePdfUpload(pdfFile);
+                      } else {
+                        showToast("Please choose a PDF file first!", "error");
+                      }
+                    }}
+                    disabled={loading || !pdfFile}
+                    className="flex-1 bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 disabled:from-slate-800 disabled:to-slate-800 disabled:text-slate-500 font-semibold text-xs py-2.5 px-4 rounded-xl shadow-lg transition-all flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    {pdfUploading ? (
+                      <>
+                        <svg className="animate-spin h-4 w-4 text-white" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                        </svg>
+                        Parsing PDF...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                        </svg>
+                        Ingest PDF
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
-            </form>
+            )}
           </div>
 
           {/* Progress Tracker Widget */}
           {totalCount > 0 && (
             <div className="p-6 rounded-2xl glass-effect shadow-xl flex flex-col gap-4">
               <div>
-                <h3 className="text-sm font-semibold text-slate-300 dark:text-slate-300 light:text-slate-800">Mastery Progress</h3>
+                <h3 className="text-sm font-semibold text-slate-800 dark:text-slate-300">Mastery Progress</h3>
                 <p className="text-xs text-slate-500 mt-0.5">Track your active recall stats.</p>
               </div>
 
@@ -680,7 +1101,7 @@ export default function Home() {
                     {masteredCount} / {totalCount} cards
                   </span>
                 </div>
-                <div className="w-full h-2.5 bg-slate-900/50 dark:bg-slate-900/50 light:bg-slate-200 rounded-full overflow-hidden border border-white/5">
+                <div className="w-full h-2.5 bg-slate-200 dark:bg-slate-900/50 rounded-full overflow-hidden border border-white/5">
                   <div
                     className="h-full bg-gradient-to-r from-indigo-500 to-violet-500 transition-all duration-500 ease-out"
                     style={{ width: `${masteryPercentage}%` }}
@@ -689,11 +1110,11 @@ export default function Home() {
               </div>
 
               <div className="grid grid-cols-2 gap-4 mt-1">
-                <div className="p-3.5 rounded-xl bg-slate-950/20 dark:bg-slate-950/20 light:bg-slate-100 border border-white/5 text-center">
+                <div className="p-3.5 rounded-xl bg-slate-100 dark:bg-slate-950/20 border border-slate-200 dark:border-white/5 text-center">
                   <span className="block text-xl font-bold text-indigo-400">{learningCount}</span>
                   <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Learning</span>
                 </div>
-                <div className="p-3.5 rounded-xl bg-slate-950/20 dark:bg-slate-950/20 light:bg-slate-100 border border-white/5 text-center">
+                <div className="p-3.5 rounded-xl bg-slate-100 dark:bg-slate-950/20 border border-slate-200 dark:border-white/5 text-center">
                   <span className="block text-xl font-bold text-emerald-400">{masteredCount}</span>
                   <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Mastered</span>
                 </div>
@@ -708,12 +1129,12 @@ export default function Home() {
           {/* Deck Options Bar */}
           <div className="flex flex-col sm:flex-row gap-4 items-center justify-between p-4 rounded-xl glass-effect shadow-md">
             
-            {/* View Mode Switches & Active Deck Badge */}
+            {/* View Mode & Study Mode Switches & Active Deck Badge */}
             <div className="flex flex-wrap items-center gap-3">
-              <div className="flex items-center gap-1.5 p-1 rounded-lg bg-slate-950/50 dark:bg-slate-950/50 light:bg-slate-200 border border-white/5">
+              <div className="flex items-center gap-1.5 p-1 rounded-lg bg-slate-200 dark:bg-slate-950/50 border border-slate-200 dark:border-white/5">
                 <button
                   onClick={() => setViewMode("carousel")}
-                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
                     viewMode === "carousel"
                       ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                       : "text-slate-400 hover:text-white"
@@ -723,7 +1144,7 @@ export default function Home() {
                 </button>
                 <button
                   onClick={() => setViewMode("grid")}
-                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all ${
+                  className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
                     viewMode === "grid"
                       ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                       : "text-slate-400 hover:text-white"
@@ -732,6 +1153,32 @@ export default function Home() {
                   Grid
                 </button>
               </div>
+
+              {/* Study Mode: Flip Cards vs Quiz Mode */}
+              {viewMode === "carousel" && (
+                <div className="flex items-center gap-1.5 p-1 rounded-lg bg-slate-200 dark:bg-slate-950/50 border border-slate-200 dark:border-white/5">
+                  <button
+                    onClick={() => setStudyMode("flip")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
+                      studyMode === "flip"
+                        ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Flip Cards
+                  </button>
+                  <button
+                    onClick={() => setStudyMode("quiz")}
+                    className={`px-3 py-1.5 rounded-md text-xs font-semibold transition-all cursor-pointer ${
+                      studyMode === "quiz"
+                        ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                        : "text-slate-400 hover:text-white"
+                    }`}
+                  >
+                    Quiz Mode
+                  </button>
+                </div>
+              )}
 
               {/* Active Deck Title Badge */}
               {totalCount > 0 && (
@@ -760,7 +1207,7 @@ export default function Home() {
                   setFilterMode(e.target.value);
                   setActiveCardIndex(0);
                 }}
-                className="bg-slate-950/60 dark:bg-slate-950/60 light:bg-white border border-white/10 dark:border-white/10 light:border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-300 dark:text-slate-300 light:text-slate-900 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
+                className="bg-white dark:bg-slate-950/60 border border-slate-300 dark:border-white/10 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium"
               >
                 <option value="all">Show All Cards</option>
                 <option value="learning">Show Learning</option>
@@ -775,7 +1222,7 @@ export default function Home() {
                   setActiveCardIndex(0);
                 }}
                 placeholder="Search cards..."
-                className="bg-slate-950/60 dark:bg-slate-950/60 light:bg-white border border-white/10 dark:border-white/10 light:border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-300 dark:text-slate-300 light:text-slate-900 focus:outline-none focus:ring-1 focus:ring-indigo-500 placeholder:text-slate-600 dark:placeholder:text-slate-500 w-36 sm:w-48 font-medium"
+                className="bg-white dark:bg-slate-950/60 border border-slate-300 dark:border-white/10 rounded-lg px-3 py-1.5 text-xs text-slate-900 dark:text-slate-300 focus:outline-none focus:ring-1 focus:ring-indigo-500 placeholder:text-slate-600 dark:placeholder:text-slate-500 w-36 sm:w-48 font-medium"
               />
             </div>
           </div>
@@ -788,7 +1235,7 @@ export default function Home() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253" />
                 </svg>
               </div>
-              <h3 className="text-base font-semibold text-slate-300 dark:text-slate-300 light:text-slate-800">No Flashcards Available</h3>
+              <h3 className="text-base font-semibold text-slate-800 dark:text-slate-300">No Flashcards Available</h3>
               <p className="text-xs text-slate-500 mt-2 max-w-sm">
                 {flashcards.length === 0
                   ? "Enter some study notes in the left panel and click 'Generate Cards' to create an active recall study deck."
@@ -814,138 +1261,232 @@ export default function Home() {
               {viewMode === "carousel" && (
                 <div className="flex flex-col gap-6 items-center">
                   
-                  {/* Card wrapper */}
-                  <div className="relative w-full max-w-xl h-80 perspective-1000">
-                    
-                    {/* Inner flippable card */}
-                    <div
-                      onClick={() => setIsFlipped(!isFlipped)}
-                      className={`relative w-full h-full transform-style-3d transition-transform duration-500 cursor-pointer ${
-                        isFlipped ? "rotate-y-180" : ""
-                      }`}
-                    >
-                      {/* CARD FRONT */}
-                      <div className={`absolute inset-0 backface-hidden rounded-2xl glass-effect p-8 flex flex-col justify-between shadow-2xl transition-all ${
-                        filteredCards[activeCardIndex].mastered ? "border-emerald-500/20" : "border-white/10"
-                      }`}>
+                  {studyMode === "quiz" ? (
+                    <div className="w-full max-w-xl rounded-2xl glass-effect p-8 flex flex-col justify-between shadow-2xl transition-all min-h-80 border border-white/10">
+                      {/* Quiz Header */}
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] font-bold tracking-wider uppercase bg-indigo-500/20 text-indigo-400 px-2.5 py-1 rounded-full">
+                          Quiz Mode
+                        </span>
                         
-                        {/* Front Header */}
-                        <div className="flex items-center justify-between">
-                          <span className="text-[10px] font-bold tracking-wider uppercase bg-indigo-500/20 text-indigo-400 px-2.5 py-1 rounded-full">
-                            Question
-                          </span>
-                          
-                          <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={() => speakText(filteredCards[activeCardIndex].question)}
-                              className={`p-2 rounded-lg hover:bg-white/5 transition-all text-slate-400 hover:text-white ${isSpeaking ? "text-indigo-400" : ""}`}
-                              title="Listen to question"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => handleDeleteCard(filteredCards[activeCardIndex].id)}
-                              className="p-2 rounded-lg hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 transition-all"
-                              title="Delete card"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Front Content */}
-                        <div className="flex-1 flex items-center justify-center text-center py-4">
-                          <p className="text-lg sm:text-xl font-medium leading-relaxed max-w-md text-slate-100 dark:text-slate-100 light:text-slate-900">
-                            {filteredCards[activeCardIndex].question}
-                          </p>
-                        </div>
-
-                        {/* Front Footer */}
-                        <div className="flex justify-between items-center text-xs text-slate-500 font-semibold uppercase">
-                          <span>Click card to reveal answer</span>
-                          {filteredCards[activeCardIndex].mastered && (
-                            <span className="text-emerald-400 flex items-center gap-1">
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-                              </svg>
-                              Mastered
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* CARD BACK */}
-                      <div className="absolute inset-0 backface-hidden rotate-y-180 rounded-2xl bg-slate-900/90 dark:bg-slate-900/90 light:bg-white border border-indigo-500/30 p-8 flex flex-col justify-between shadow-2xl transition-all">
-                        
-                        {/* Back Header */}
-                        <div className="flex items-center justify-between">
-                          <span className="text-[10px] font-bold tracking-wider uppercase bg-emerald-500/20 text-emerald-400 px-2.5 py-1 rounded-full">
-                            Answer
-                          </span>
-                          
-                          <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              onClick={() => speakText(filteredCards[activeCardIndex].answer)}
-                              className={`p-2 rounded-lg hover:bg-white/5 transition-all text-slate-400 hover:text-white ${isSpeaking ? "text-indigo-400" : ""}`}
-                              title="Listen to answer"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-                              </svg>
-                            </button>
-                            <button
-                              onClick={() => handleDeleteCard(filteredCards[activeCardIndex].id)}
-                              className="p-2 rounded-lg hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 transition-all"
-                              title="Delete card"
-                            >
-                              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                              </svg>
-                            </button>
-                          </div>
-                        </div>
-
-                        {/* Back Content */}
-                        <div className="flex-1 flex items-center justify-center text-center py-4">
-                          <p className="text-base sm:text-lg leading-relaxed max-w-md text-slate-100 dark:text-slate-100 light:text-slate-900 font-medium">
-                            {filteredCards[activeCardIndex].answer}
-                          </p>
-                        </div>
-
-                        {/* Back Footer Controls */}
-                        <div className="flex gap-3 justify-center" onClick={(e) => e.stopPropagation()}>
+                        <div className="flex items-center gap-2">
                           <button
-                            onClick={() => toggleMastered(filteredCards[activeCardIndex].id)}
-                            className={`flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold border transition-all ${
-                              filteredCards[activeCardIndex].mastered
-                                ? "bg-rose-500/10 border-rose-500/20 text-rose-400 hover:bg-rose-500/20"
-                                : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20"
-                            }`}
+                            onClick={() => speakText(filteredCards[activeCardIndex].question)}
+                            className={`p-2 rounded-lg hover:bg-white/5 transition-all text-slate-400 hover:text-white ${isSpeaking ? "text-indigo-400" : ""}`}
+                            title="Listen to question"
                           >
-                            {filteredCards[activeCardIndex].mastered ? (
-                              <>
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                                </svg>
-                                Need Review
-                              </>
-                            ) : (
-                              <>
-                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
-                                </svg>
-                                Got it! Mastered
-                              </>
-                            )}
+                            <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                            </svg>
                           </button>
                         </div>
                       </div>
+
+                      {/* Question Text */}
+                      <div className="my-6 text-center">
+                        <p className="text-base sm:text-lg font-bold leading-relaxed text-slate-900 dark:text-slate-100">
+                          {filteredCards[activeCardIndex].question}
+                        </p>
+                      </div>
+
+                      {/* Multiple Choice Options */}
+                      <div className="flex flex-col gap-3 w-full">
+                        {shuffledChoices.map((option, idx) => {
+                          const correct = filteredCards[activeCardIndex].answer || filteredCards[activeCardIndex].correct_answer || "";
+                          const isCorrect = option === correct;
+                          const isSelected = selectedAnswer === option;
+                          const hasAnswered = selectedAnswer !== null;
+
+                          let optionBtnClass = "w-full text-left px-4 py-3 text-sm rounded-xl border transition-all duration-200 active:scale-[0.99] cursor-pointer flex justify-between items-center ";
+                          
+                          if (!hasAnswered) {
+                            optionBtnClass += "bg-slate-100 hover:bg-slate-200 dark:bg-slate-950/40 dark:hover:bg-slate-900 border-slate-200 dark:border-white/10 hover:border-indigo-500 text-slate-900 dark:text-slate-300";
+                          } else if (isCorrect) {
+                            optionBtnClass += "bg-emerald-950/40 border-emerald-500 text-emerald-400 font-bold shadow-lg shadow-emerald-500/10";
+                          } else if (isSelected) {
+                            optionBtnClass += "bg-rose-950/40 border-rose-500 text-rose-400 font-bold shadow-lg shadow-rose-500/10";
+                          } else {
+                            optionBtnClass += "bg-slate-950/20 border-white/5 text-slate-500 cursor-not-allowed";
+                          }
+
+                          return (
+                            <button
+                              key={idx}
+                              onClick={() => handleSelectOption(option)}
+                              disabled={hasAnswered}
+                              className={optionBtnClass}
+                            >
+                              <span>{option}</span>
+                              {hasAnswered && isCorrect && (
+                                <svg className="w-4 h-4 text-emerald-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                                </svg>
+                              )}
+                              {hasAnswered && isSelected && !isCorrect && (
+                                <svg className="w-4 h-4 text-rose-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+                                </svg>
+                              )}
+                            </button>
+                          );
+                        })}
+                      </div>
+
+                      {selectedAnswer !== null && (
+                        <div className="mt-6 flex flex-col items-center gap-2.5 animate-scale-up">
+                          <span className="text-[10px] uppercase tracking-wider font-bold text-slate-400">
+                            {selectedAnswer === (filteredCards[activeCardIndex].answer || filteredCards[activeCardIndex].correct_answer || "") 
+                              ? "🎉 Correct! SM-2 schedule set to Easy."
+                              : "❌ Incorrect. SM-2 schedule set to Again."}
+                          </span>
+                          <button
+                            onClick={() => {
+                              setSelectedAnswer(null);
+                              if (activeCardIndex < filteredCards.length - 1) {
+                                setActiveCardIndex(prev => prev + 1);
+                              } else {
+                                setActiveCardIndex(0);
+                              }
+                            }}
+                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-xl shadow-md transition-all cursor-pointer"
+                          >
+                            Next Question
+                          </button>
+                        </div>
+                      )}
                     </div>
-                  </div>
+                  ) : (
+                    <div className="relative w-full max-w-xl h-80 perspective-1000">
+                      {/* Inner flippable card */}
+                      <div
+                        onClick={() => setIsFlipped(!isFlipped)}
+                        className={`relative w-full h-full transform-style-3d transition-transform duration-500 cursor-pointer ${
+                          isFlipped ? "rotate-y-180" : ""
+                        }`}
+                      >
+                        {/* CARD FRONT */}
+                        <div className={`absolute inset-0 backface-hidden rounded-2xl glass-effect p-8 flex flex-col justify-between shadow-2xl transition-all ${
+                          filteredCards[activeCardIndex].mastered ? "border-emerald-500/20" : "border-white/10"
+                        }`}>
+                          
+                          {/* Front Header */}
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold tracking-wider uppercase bg-indigo-500/20 text-indigo-400 px-2.5 py-1 rounded-full">
+                              Question
+                            </span>
+                            
+                            <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                onClick={() => speakText(filteredCards[activeCardIndex].question)}
+                                className={`p-2 rounded-lg hover:bg-white/5 transition-all text-slate-400 hover:text-white ${isSpeaking ? "text-indigo-400" : ""}`}
+                                title="Listen to question"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={() => handleDeleteCard(filteredCards[activeCardIndex].id)}
+                                className="p-2 rounded-lg hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 transition-all"
+                                title="Delete card"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Front Content */}
+                          <div className="flex-1 flex items-center justify-center text-center py-4">
+                            <p className="text-lg sm:text-xl font-medium leading-relaxed max-w-md text-slate-900 dark:text-slate-100">
+                              {filteredCards[activeCardIndex].question}
+                            </p>
+                          </div>
+
+                          {/* Front Footer */}
+                          <div className="flex justify-between items-center text-xs text-slate-500 font-semibold uppercase">
+                            <span>Click card to reveal answer</span>
+                            {filteredCards[activeCardIndex].mastered && (
+                              <span className="text-emerald-400 flex items-center gap-1">
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+                                </svg>
+                                Mastered
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* CARD BACK */}
+                        <div className="absolute inset-0 backface-hidden rotate-y-180 rounded-2xl bg-white dark:bg-slate-900/90 border border-indigo-500/30 p-8 flex flex-col justify-between shadow-2xl transition-all">
+                          
+                          {/* Back Header */}
+                          <div className="flex items-center justify-between">
+                            <span className="text-[10px] font-bold tracking-wider uppercase bg-emerald-500/20 text-emerald-400 px-2.5 py-1 rounded-full">
+                              Answer
+                            </span>
+                            
+                            <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                              <button
+                                onClick={() => speakText(filteredCards[activeCardIndex].answer || filteredCards[activeCardIndex].correct_answer || "")}
+                                className={`p-2 rounded-lg hover:bg-white/5 transition-all text-slate-400 hover:text-white ${isSpeaking ? "text-indigo-400" : ""}`}
+                                title="Listen to answer"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                                </svg>
+                              </button>
+                              <button
+                                onClick={() => handleDeleteCard(filteredCards[activeCardIndex].id)}
+                                className="p-2 rounded-lg hover:bg-rose-500/10 text-slate-400 hover:text-rose-400 transition-all"
+                                title="Delete card"
+                              >
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Back Content */}
+                          <div className="flex-1 flex items-center justify-center text-center py-4">
+                            <p className="text-base sm:text-lg leading-relaxed max-w-md text-slate-900 dark:text-slate-100 font-medium">
+                              {filteredCards[activeCardIndex].answer}
+                            </p>
+                          </div>
+
+                          {/* Back Footer Spaced Repetition Rating Buttons */}
+                          <div className="flex flex-col items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                            <span className="text-[10px] uppercase font-bold tracking-wider text-slate-500">Rate recall:</span>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => rateCard(filteredCards[activeCardIndex].id, 1)}
+                                className="px-4 py-2 text-xs font-bold rounded-xl bg-rose-600 hover:bg-rose-500 text-white shadow-lg shadow-rose-600/20 transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
+                                title="Again (Incorrect/Forgot)"
+                              >
+                                Again
+                              </button>
+                              <button
+                                onClick={() => rateCard(filteredCards[activeCardIndex].id, 3)}
+                                className="px-4 py-2 text-xs font-bold rounded-xl bg-amber-600 hover:bg-amber-500 text-white shadow-lg shadow-amber-600/20 transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
+                                title="Hard (Correct with effort)"
+                              >
+                                Hard
+                              </button>
+                              <button
+                                onClick={() => rateCard(filteredCards[activeCardIndex].id, 5)}
+                                className="px-4 py-2 text-xs font-bold rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20 transition-all active:scale-95 flex items-center gap-1 cursor-pointer"
+                                title="Easy (Immediate recall)"
+                              >
+                                Easy
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Navigation Dots and Controls */}
                   <div className="flex items-center justify-between w-full max-w-xl px-4 mt-2">
@@ -1005,6 +1546,7 @@ export default function Home() {
                       key={card.id}
                       card={card}
                       onToggleMastered={toggleMastered}
+                      onRate={rateCard}
                       onDelete={handleDeleteCard}
                       onSpeak={speakText}
                       isSpeaking={isSpeaking}
@@ -1330,12 +1872,13 @@ export default function Home() {
 interface GridCardProps {
   card: Flashcard;
   onToggleMastered: (id: string) => void;
+  onRate: (id: string, rating: number) => void;
   onDelete: (id: string) => void;
   onSpeak: (text: string) => void;
   isSpeaking: boolean;
 }
 
-function GridCard({ card, onToggleMastered, onDelete, onSpeak, isSpeaking }: GridCardProps) {
+function GridCard({ card, onToggleMastered, onRate, onDelete, onSpeak, isSpeaking }: GridCardProps) {
   const [flipped, setFlipped] = useState(false);
 
   return (
@@ -1378,7 +1921,7 @@ function GridCard({ card, onToggleMastered, onDelete, onSpeak, isSpeaking }: Gri
           </div>
 
           <div className="flex-1 flex items-center justify-center text-center py-2">
-            <p className="text-sm font-semibold leading-relaxed text-slate-100 dark:text-slate-100 light:text-slate-900 line-clamp-4">
+            <p className="text-sm font-semibold leading-relaxed text-slate-900 dark:text-slate-100 line-clamp-4">
               {card.question}
             </p>
           </div>
@@ -1390,7 +1933,7 @@ function GridCard({ card, onToggleMastered, onDelete, onSpeak, isSpeaking }: Gri
         </div>
 
         {/* BACK */}
-        <div className="absolute inset-0 backface-hidden rotate-y-180 rounded-2xl bg-slate-900/90 dark:bg-slate-900/90 light:bg-white border border-indigo-500/30 p-6 flex flex-col justify-between shadow-lg transition-all">
+        <div className="absolute inset-0 backface-hidden rotate-y-180 rounded-2xl bg-white dark:bg-slate-900/90 border border-indigo-500/30 p-6 flex flex-col justify-between shadow-lg transition-all">
           
           <div className="flex items-center justify-between">
             <span className="text-[9px] font-bold tracking-wider uppercase bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full">
@@ -1419,21 +1962,32 @@ function GridCard({ card, onToggleMastered, onDelete, onSpeak, isSpeaking }: Gri
           </div>
 
           <div className="flex-1 flex items-center justify-center text-center py-2">
-            <p className="text-xs font-medium leading-relaxed text-slate-100 dark:text-slate-100 light:text-slate-900 line-clamp-4 font-medium">
+            <p className="text-xs font-medium leading-relaxed text-slate-900 dark:text-slate-100 line-clamp-4 font-medium">
               {card.answer}
             </p>
           </div>
 
-          <div className="flex justify-center" onClick={(e) => e.stopPropagation()}>
+          <div className="flex justify-center gap-1" onClick={(e) => e.stopPropagation()}>
             <button
-              onClick={() => onToggleMastered(card.id)}
-              className={`px-3 py-1 rounded-lg text-[10px] font-semibold border transition-all ${
-                card.mastered
-                  ? "bg-rose-500/10 border-rose-500/20 text-rose-400 hover:bg-rose-500/20"
-                  : "bg-emerald-500/10 border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20"
-              }`}
+              onClick={() => onRate(card.id, 1)}
+              className="px-2 py-1 text-[9px] font-bold rounded-lg bg-rose-600 hover:bg-rose-500 text-white transition-all active:scale-95 cursor-pointer"
+              title="Again"
             >
-              {card.mastered ? "Need Review" : "Got it!"}
+              Again
+            </button>
+            <button
+              onClick={() => onRate(card.id, 3)}
+              className="px-2 py-1 text-[9px] font-bold rounded-lg bg-amber-600 hover:bg-amber-500 text-white transition-all active:scale-95 cursor-pointer"
+              title="Hard"
+            >
+              Hard
+            </button>
+            <button
+              onClick={() => onRate(card.id, 5)}
+              className="px-2 py-1 text-[9px] font-bold rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition-all active:scale-95 cursor-pointer"
+              title="Easy"
+            >
+              Easy
             </button>
           </div>
         </div>
