@@ -89,6 +89,10 @@ db.serialize(() => {
         )
     `);
 
+    db.run('CREATE INDEX IF NOT EXISTS idx_decks_user_id ON decks(user_id)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_flashcards_deck_id ON flashcards(deck_id)');
+
+
     // Migration logic for existing databases
     const columns = [
         { name: 'ease_factor', type: 'REAL DEFAULT 2.5' },
