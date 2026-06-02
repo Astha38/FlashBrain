@@ -6,7 +6,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('./database');
 const multer = require('multer');
-const pdfParse = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
 require('dotenv').config();
 
 // Configure Multer for PDF file uploading
@@ -369,8 +369,10 @@ app.post('/api/upload-pdf', upload.single('file'), async (req, res) => {
         }
 
         // Parse text from file buffer
-        const parsedPdf = await pdfParse(req.file.buffer);
+        const parser = new PDFParse({ data: req.file.buffer });
+        const parsedPdf = await parser.getText();
         const extractedText = parsedPdf.text;
+        await parser.destroy();
 
         if (!extractedText || extractedText.trim().length === 0) {
             return res.status(400).json({ error: 'Could not extract text content from the uploaded PDF.' });

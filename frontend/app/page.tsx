@@ -161,6 +161,12 @@ export default function Home() {
     }
   }, [token]);
 
+  const currentCard = filteredCards[activeCardIndex];
+  const currentCardId = currentCard?.id;
+  const currentCardQuestion = currentCard?.question;
+  const currentCardAnswer = currentCard?.answer || currentCard?.correct_answer;
+  const currentCardDistractorsJSON = JSON.stringify(currentCard?.distractors || []);
+
   // Shuffling logic for Quiz Mode choices
   useEffect(() => {
     if (filteredCards.length > 0 && activeCardIndex < filteredCards.length) {
@@ -194,7 +200,7 @@ export default function Home() {
       setShuffledChoices([]);
       setSelectedAnswer(null);
     }
-  }, [activeCardIndex, filteredCards, studyMode]);
+  }, [activeCardIndex, studyMode, currentCardId, currentCardQuestion, currentCardAnswer, currentCardDistractorsJSON]);
 
   // Save anonymous cards to localStorage when updated
   const saveCards = (newCards: Flashcard[]) => {
