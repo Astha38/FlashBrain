@@ -1,4 +1,4 @@
-# ⚡ Flash Brain
+# ⚡ Flash Brain 
 
 An intuitive, fast, and interactive web application designed to supercharge your learning through smart flashcards and active recall. 
 
